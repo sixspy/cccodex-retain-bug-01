@@ -19,4 +19,14 @@ def test_seed_policies_and_partitions(authed):
     parts = authed.get("/api/partitions").json()["items"]
     assert len(policies) >= 4
     assert len(parts) >= 10
-    assert all(p["active"] == 1 for p in policies)
+    # 列表同时返回现行版与影子版；现行版每域有且仅有一条
+    active = [p for p in policies if p["active"] == 1]
+    domains = {p["domain_code"] for p in active}
+    assert len(active) == len(domains)
+    # 种子自带 orders 影子版本（v2, active=0），用于演示晋升
+    orders_versions = sorted(
+        (p["version"], p["active"]) for p in policies if p["domain_code"] == "orders"
+    )
+    assert (2, 0) in orders_versions
+    # 分区卡片必须挂上现行策略版本，与策略列表对齐
+    assert all(p.get("current_policy_version") for p in parts)

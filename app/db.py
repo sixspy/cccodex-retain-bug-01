@@ -8,9 +8,10 @@ from app.config import Config
 def connect(db_path: str | None = None) -> sqlite3.Connection:
     path = db_path or Config.database()
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, check_same_thread=False)
+    conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 30000")
     return conn
 
 
@@ -19,13 +20,7 @@ def get_db(db_path: str | None = None):
     conn = connect(db_path)
     try:
         yield conn
-        if SEED_POLICIES_DUAL:
-            conn.execute(
-                "INSERT INTO retain_policies "
-                "(domain_code, domain_name, keep_days, action_on_expire, version, active) "
-                "VALUES ('orders','订单明细域',9,'归档',2,1)"
-            )
-        conn.commit()  # SEED_DUAL_ACTIVE
+        conn.commit()
     except Exception:
         conn.rollback()
         raise
@@ -45,6 +40,9 @@ CREATE TABLE IF NOT EXISTS retain_policies (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   UNIQUE(domain_code, version)
 );
+
+-- 现行版唯一约束（部分唯一索引）在 init_db 中、存量数据自愈之后显式创建，
+-- 见 init_db() 中的 CREATE UNIQUE INDEX ux_retain_policies_one_active。
 
 CREATE TABLE IF NOT EXISTS partitions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,7 +88,7 @@ CREATE TABLE IF NOT EXISTS execute_runs (
   action TEXT NOT NULL,
   result_state TEXT NOT NULL,
   archive_uri TEXT,
-  ok INTEGER NOT NULL,
+  ok INTEGER NOT NULL DEFAULT 1,
   detail TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY(judgment_id) REFERENCES judgments(id)
@@ -114,13 +112,15 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
-
-SEED_POLICIES_DUAL = True
+# 每个主题域一条现行版本（v1, active=1）；orders 另附一条影子版本（v2, active=0）
+# 用于演示「影子快照 → 晋升原子切换」，全程不产生双现行。
 SEED_POLICIES = [
-    ("orders", "订单明细域", 7, "归档"),
-    ("payments", "支付流水域", 14, "归档"),
-    ("events", "埋点事件域", 3, "销毁"),
-    ("inventory", "库存快照域", 10, "归档"),
+    # domain_code, domain_name, keep_days, action_on_expire, version, active
+    ("orders", "订单明细域", 7, "归档", 1, 1),
+    ("orders", "订单明细域", 9, "归档", 2, 0),
+    ("payments", "支付流水域", 14, "归档", 1, 1),
+    ("events", "埋点事件域", 3, "销毁", 1, 1),
+    ("inventory", "库存快照域", 10, "归档", 1, 1),
 ]
 
 SEED_PARTITIONS = [
@@ -139,17 +139,56 @@ SEED_PARTITIONS = [
 ]
 
 
+def _heal_dual_active(conn: sqlite3.Connection) -> int:
+    """存量库自愈：同一主题域若有多条 active=1，仅保留版本号最高的一条。
+
+    必须在部分唯一索引创建之前执行，否则建索引会直接失败。
+    返回被降级的行数。
+    """
+    dupes = conn.execute(
+        "SELECT domain_code, COUNT(*) AS c FROM retain_policies "
+        "WHERE active = 1 GROUP BY domain_code HAVING c > 1"
+    ).fetchall()
+    healed = 0
+    for row in dupes:
+        keep = conn.execute(
+            "SELECT MAX(version) AS v FROM retain_policies "
+            "WHERE domain_code = ? AND active = 1",
+            (row["domain_code"],),
+        ).fetchone()["v"]
+        cur = conn.execute(
+            "UPDATE retain_policies SET active = 0 "
+            "WHERE domain_code = ? AND active = 1 AND version <> ?",
+            (row["domain_code"], keep),
+        )
+        healed += cur.rowcount
+    return healed
+
+
 def init_db(db_path: str | None = None) -> None:
     with get_db(db_path) as conn:
         conn.executescript(SCHEMA)
+        # 旧库可能已落入双现行（缺陷期数据）：先自愈，再补唯一索引。
+        _heal_dual_active(conn)
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_retain_policies_one_active "
+            "ON retain_policies(domain_code) WHERE active = 1"
+        )
         n = conn.execute("SELECT COUNT(*) AS c FROM retain_policies").fetchone()["c"]
         if n == 0:
-            for domain_code, domain_name, keep_days, action in SEED_POLICIES:
+            for (
+                domain_code,
+                domain_name,
+                keep_days,
+                action,
+                version,
+                active,
+            ) in SEED_POLICIES:
                 conn.execute(
                     "INSERT INTO retain_policies "
                     "(domain_code, domain_name, keep_days, action_on_expire, version, active) "
-                    "VALUES (?,?,?,?,1,1)",
-                    (domain_code, domain_name, keep_days, action),
+                    "VALUES (?,?,?,?,?,?)",
+                    (domain_code, domain_name, keep_days, action, version, active),
                 )
             for domain_code, biz_date, row_count, state in SEED_PARTITIONS:
                 conn.execute(

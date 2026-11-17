@@ -30,14 +30,20 @@
     return `<span class="tag ${cls}">${state}</span>`;
   }
 
+  function activeTag(active) {
+    return Number(active) === 1
+      ? `<span class="tag ok">现行</span>`
+      : `<span class="tag">影子</span>`;
+  }
+
   async function renderPolicies() {
     const data = await api("/api/policies");
     main.innerHTML = `
       <section class="panel">
-        <h2>现行留存策略</h2>
-        <p class="sub">每个主题域一条现行版本：保留天数与到期动作（归档或销毁）。</p>
+        <h2>留存策略版本</h2>
+        <p class="sub">每个主题域有且仅有一条现行版本（库内部分唯一索引约束）；新版本先落影子快照，再原子晋升切换。</p>
         <table>
-          <thead><tr><th>主题域</th><th>编码</th><th>保留天</th><th>到期动作</th><th>版本</th></tr></thead>
+          <thead><tr><th>主题域</th><th>编码</th><th>保留天</th><th>到期动作</th><th>版本</th><th>状态</th><th>操作</th></tr></thead>
           <tbody>
             ${data.items
               .map(
@@ -47,12 +53,72 @@
               <td>${p.keep_days}</td>
               <td>${tag(p.action_on_expire)}</td>
               <td>v${p.version}</td>
+              <td>${activeTag(p.active)}</td>
+              <td>${
+                Number(p.active) === 1
+                  ? "—"
+                  : `<button type="button" data-promote="${p.id}">晋升为现行</button>`
+              }</td>
             </tr>`
               )
               .join("")}
           </tbody>
         </table>
+      </section>
+      <section class="panel">
+        <h2>发布新版本（影子快照 → 原子切换）</h2>
+        <div class="toolbar">
+          <label class="field">主题域编码
+            <input id="np-domain" placeholder="如 orders" />
+          </label>
+          <label class="field">主题域名称
+            <input id="np-name" placeholder="如 订单明细域" />
+          </label>
+          <label class="field">保留天
+            <input id="np-days" type="number" min="0" value="7" />
+          </label>
+          <label class="field">到期动作
+            <select id="np-action"><option>归档</option><option>销毁</option></select>
+          </label>
+          <button type="button" id="btn-publish">发布并晋升</button>
+        </div>
+        <p class="sub" id="np-msg"></p>
       </section>`;
+    main.querySelectorAll("[data-promote]").forEach((btn) => {
+      btn.onclick = async () => {
+        try {
+          await api(`/api/policies/${btn.dataset.promote}/promote`, {
+            method: "POST",
+          });
+        } catch (err) {
+          alert(err.message);
+        }
+        await renderPolicies();
+      };
+    });
+    document.getElementById("btn-publish").onclick = async () => {
+      const msg = document.getElementById("np-msg");
+      try {
+        const body = {
+          domain_code: document.getElementById("np-domain").value.trim(),
+          domain_name: document.getElementById("np-name").value.trim(),
+          keep_days: Number(document.getElementById("np-days").value),
+          action_on_expire: document.getElementById("np-action").value,
+        };
+        if (!body.domain_code) {
+          msg.textContent = "主题域编码不能为空";
+          return;
+        }
+        const res = await api("/api/policies/publish", {
+          method: "POST",
+          body: JSON.stringify(body),
+        });
+        msg.textContent = `已发布并晋升：${res.policy.domain_code} v${res.policy.policy_version ?? res.policy.version}`;
+      } catch (err) {
+        msg.textContent = err.message;
+      }
+      await renderPolicies();
+    };
   }
 
   async function renderPartitions() {
@@ -60,9 +126,9 @@
     main.innerHTML = `
       <section class="panel">
         <h2>实物分区</h2>
-        <p class="sub">在线 / 已归档 / 已销毁 / 裁撤中。数字与后续对账同源。</p>
+        <p class="sub">在线 / 已归档 / 已销毁 / 裁撤中。每行挂上该主题域当前现行策略版本与保留天，与策略列表同源对齐。</p>
         <table>
-          <thead><tr><th>主题域</th><th>业务日</th><th>行数</th><th>存储态</th><th>归档地址</th></tr></thead>
+          <thead><tr><th>主题域</th><th>业务日</th><th>行数</th><th>存储态</th><th>归档地址</th><th>现行策略</th><th>保留天</th></tr></thead>
           <tbody>
             ${data.items
               .map(
@@ -72,12 +138,48 @@
               <td>${p.row_count}</td>
               <td>${tag(p.storage_state)}</td>
               <td class="mono">${p.archive_uri || "—"}</td>
+              <td>${
+                p.current_policy_version
+                  ? `v${p.current_policy_version}`
+                  : `<span class="tag bad">未挂现行策略</span>`
+              }</td>
+              <td>${p.current_keep_days ?? "—"}</td>
             </tr>`
               )
               .join("")}
           </tbody>
         </table>
       </section>`;
+  }
+
+  async function renderScanDetail(jobId) {
+    const detail = document.getElementById("scan-detail");
+    if (!detail) return;
+    const data = await api(`/api/judgments?scan_job_id=${jobId}`);
+    detail.innerHTML = `
+      <h3>扫描任务 #${jobId} · 裁决读版明细</h3>
+      <table>
+        <thead><tr><th>裁决号</th><th>主题域</th><th>业务日</th><th>命中策略版本</th><th>保留天</th><th>动作</th><th>状态</th></tr></thead>
+        <tbody>
+          ${
+            data.items.length
+              ? data.items
+                  .map(
+                    (j) => `<tr>
+              <td>${j.id}</td>
+              <td class="mono">${j.domain_code}</td>
+              <td class="mono">${j.biz_date}</td>
+              <td>v${j.policy_version}</td>
+              <td>${j.keep_days}天</td>
+              <td>${j.decided_action}</td>
+              <td>${tag(j.status)}</td>
+            </tr>`
+                  )
+                  .join("")
+              : `<tr><td colspan="7" class="empty">该任务未生成裁决</td></tr>`
+          }
+        </tbody>
+      </table>`;
   }
 
   async function renderScan() {
@@ -92,7 +194,7 @@
       <section class="panel">
         <h2>扫描任务</h2>
         <table>
-          <thead><tr><th>编号</th><th>基准日</th><th>状态</th><th>到期数</th><th>说明</th></tr></thead>
+          <thead><tr><th>编号</th><th>基准日</th><th>状态</th><th>到期数</th><th>说明</th><th>操作</th></tr></thead>
           <tbody>
             ${
               jobs.items.length
@@ -104,14 +206,16 @@
               <td>${tag(j.status)}</td>
               <td>${j.expired_count}</td>
               <td>${j.message}</td>
+              <td><button type="button" data-job="${j.id}">详情</button></td>
             </tr>`
                     )
                     .join("")
-                : `<tr><td colspan="5" class="empty">尚无扫描任务</td></tr>`
+                : `<tr><td colspan="6" class="empty">尚无扫描任务</td></tr>`
             }
           </tbody>
         </table>
-      </section>`;
+      </section>
+      <section class="panel" id="scan-detail"><p class="sub">点「详情」查看该任务每条裁决命中的策略版本。</p></section>`;
     document.getElementById("btn-scan").onclick = async () => {
       const as_of_date = document.getElementById("as-of").value.trim();
       await api("/api/scan-jobs", {
@@ -120,6 +224,9 @@
       });
       await renderScan();
     };
+    main.querySelectorAll("[data-job]").forEach((btn) => {
+      btn.onclick = () => renderScanDetail(btn.dataset.job);
+    });
   }
 
   async function renderJudgments() {

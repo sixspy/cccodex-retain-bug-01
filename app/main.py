@@ -8,6 +8,8 @@ from itsdangerous import BadSignature, URLSafeSerializer
 from app.config import Config
 from app.db import get_db, init_db
 from app.services import (
+    PolicyError,
+    create_shadow_policy,
     execute_judgment,
     list_judgments,
     list_partitions,
@@ -15,6 +17,8 @@ from app.services import (
     list_reports,
     list_runs,
     list_scan_jobs,
+    promote_policy,
+    publish_policy,
     run_expire_scan,
     run_reconcile,
 )
@@ -105,11 +109,77 @@ def api_meta(request: Request):
 
 @app.get("/api/policies")
 def api_policies(request: Request):
+    """返回全部版本（含 active=0 影子版），现行/影子标记由库内 active 唯一可核。"""
     require_user(request)
     with get_db() as conn:
         items = list_policies(conn, active_only=False)
-        # list still marks every active=1 as current
-        return {"items": [i for i in items if i.get("active")] }
+        return {"items": items}
+
+
+@app.post("/api/policies/shadow")
+async def api_create_shadow(request: Request):
+    """落一条影子快照（active=0），不动现行版。"""
+    require_user(request)
+    body = await request.json()
+    domain_code = str(body.get("domain_code", "")).strip()
+    domain_name = str(body.get("domain_name", "")).strip() or domain_code
+    try:
+        keep_days = int(body.get("keep_days"))
+        action = str(body.get("action_on_expire", "")).strip()
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="keep_days 必须为整数") from exc
+    version = body.get("version")
+    try:
+        version = int(version) if version is not None else None
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="version 必须为整数") from exc
+    try:
+        with get_db() as conn:
+            policy = create_shadow_policy(
+                conn, domain_code, domain_name, keep_days, action, version
+            )
+    except PolicyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "policy": policy}
+
+
+@app.post("/api/policies/{policy_id}/promote")
+def api_promote(request: Request, policy_id: int):
+    """原子切换现行版：旧现行降影子、目标版本晋升；双版即拦（冲突 409）。"""
+    require_user(request)
+    try:
+        with get_db() as conn:
+            policy = promote_policy(conn, policy_id)
+    except PolicyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "policy": policy}
+
+
+@app.post("/api/policies/publish")
+async def api_publish(request: Request):
+    """影子快照 + 原子晋升一步到位（新换版生效窗入口）。"""
+    require_user(request)
+    body = await request.json()
+    domain_code = str(body.get("domain_code", "")).strip()
+    domain_name = str(body.get("domain_name", "")).strip() or domain_code
+    try:
+        keep_days = int(body.get("keep_days"))
+        action = str(body.get("action_on_expire", "")).strip()
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="keep_days 必须为整数") from exc
+    version = body.get("version")
+    try:
+        version = int(version) if version is not None else None
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="version 必须为整数") from exc
+    try:
+        with get_db() as conn:
+            policy = publish_policy(
+                conn, domain_code, domain_name, keep_days, action, version
+            )
+    except PolicyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "policy": policy}
 
 
 @app.get("/api/partitions")
@@ -133,8 +203,12 @@ async def api_create_scan(request: Request):
     as_of = str(body.get("as_of_date", "")).strip()
     if not as_of:
         raise HTTPException(status_code=400, detail="缺少 as_of_date")
-    with get_db() as conn:
-        job = run_expire_scan(conn, as_of)
+    try:
+        with get_db() as conn:
+            job = run_expire_scan(conn, as_of)
+    except PolicyError as exc:
+        # 同域双现行等完整性问题：拒绝扫描而非随机挑一版
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"ok": True, "job": job}
 
 
